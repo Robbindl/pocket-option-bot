@@ -4,7 +4,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from logger import setup_logger
-from mirror_trade import _deal_to_trade_event, create_trade_plan, execute_trade_plan, normalize_action
+from mirror_trade import _deal_to_trade_event, create_trade_plan, execute_trade_plan, get_child_ssids, normalize_action
 
 
 class FakeExecutor:
@@ -45,6 +45,16 @@ def test_execute_trade_plan_runs_both_accounts_once():
     assert result["master"]["action"] == "put"
     assert result["child"]["action"] == "put"
     assert result["child"]["label"] == "child"
+
+
+def test_get_child_ssids_includes_legacy_and_numbered_children():
+    config = {
+        "CHILD_SSID_2": "second",
+        "CHILD_SSID": "first",
+        "CHILD_SSID_10": "tenth",
+    }
+
+    assert get_child_ssids(config) == ["first", "second", "tenth"]
 
 
 def test_extracts_ssid_and_payload_from_wrapper():

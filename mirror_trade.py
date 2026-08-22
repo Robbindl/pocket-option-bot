@@ -551,31 +551,45 @@ def load_config() -> dict[str, str]:
         if env_value is not None:
             config[key] = env_value
 
+    for key in os.environ:
+        if re.fullmatch(r"CHILD_SSID_\d+", key):
+            config[key] = os.environ[key]
+
     return config
+
+
+def get_child_ssids(config: dict[str, str] | None = None) -> list[str]:
+    config = config or load_config()
+    child_keys = [key for key in config if re.fullmatch(r"CHILD_SSID(?:_\d+)?", key)]
+    child_keys.sort(key=lambda key: 0 if key == "CHILD_SSID" else int(key.rsplit("_", 1)[1]))
+    return [config[key] for key in child_keys if config[key].strip()]
 
 
 def main() -> None:
     config = load_config()
     master_ssid = config.get("MASTER_SSID") or os.getenv("MASTER_SSID")
-    child_ssid = config.get("CHILD_SSID") or os.getenv("CHILD_SSID")
-    if not master_ssid or not child_ssid:
-        raise SystemExit("Set MASTER_SSID and CHILD_SSID in your environment or .env file before running this script")
+    child_ssids = get_child_ssids(config)
+    if not master_ssid or not child_ssids:
+        raise SystemExit("Set MASTER_SSID and at least one CHILD_SSID in your environment or .env file before running this script")
 
-    logger.info("mirror mode enabled | master=%s | child=%s", master_ssid[:8], child_ssid[:8])
+    logger.info("mirror mode enabled | master=%s | children=%s", master_ssid[:8], len(child_ssids))
     print("One-way mirror mode enabled: the child account will mirror the master account trade automatically.")
 
     master_executor = PocketOptionTradeExecutor(master_ssid, "master")
-    child_executor = PocketOptionTradeExecutor(child_ssid, "child")
+    child_executors = [PocketOptionTradeExecutor(ssid, f"child-{index}") for index, ssid in enumerate(child_ssids, 1)]
 
     try:
-        asyncio.run(run_mirror_loop(master_executor, child_executor))
+        asyncio.run(run_mirror_loop(master_executor, child_executors))
     except KeyboardInterrupt:
         logger.info("mirror mode stopped by user")
 
 
-async def run_mirror_loop(master_executor: PocketOptionTradeExecutor, child_executor: PocketOptionTradeExecutor) -> None:
+async def run_mirror_loop(master_executor: PocketOptionTradeExecutor, child_executors: list[PocketOptionTradeExecutor]) -> None:
     logger.info("mirror loop started")
-    await asyncio.gather(master_executor.ensure_connected(), child_executor.ensure_connected())
+    await asyncio.gather(
+        master_executor.ensure_connected(),
+        *(child_executor.ensure_connected() for child_executor in child_executors),
+    )
     seen_trade_ids: set[str] = set()
 
     mirror_existing = (os.getenv("MIRROR_EXISTING_OPEN_DEALS") or load_config().get("MIRROR_EXISTING_OPEN_DEALS") or "")
@@ -603,8 +617,8 @@ async def run_mirror_loop(master_executor: PocketOptionTradeExecutor, child_exec
 
             logger.info("master trade detected | %s", json.dumps(trade_event, default=str))
             try:
-                mirrored = await mirror_trade_to_child(master_executor, child_executor, trade_event)
-                logger.info("child trade mirrored | %s", json.dumps(mirrored, default=str))
+                mirrored = await mirror_trade_to_children(master_executor, child_executors, trade_event)
+                logger.info("child trades mirrored | count=%s", len(mirrored))
             except Exception as exc:
                 logger.exception("child trade mirror failed: %s", exc)
 
@@ -650,6 +664,15 @@ async def detect_master_trade_events(
 
 
 async def mirror_trade_to_child(master_executor: PocketOptionTradeExecutor, child_executor: PocketOptionTradeExecutor, trade_event: dict[str, Any]) -> dict[str, Any]:
+    mirrored = await mirror_trade_to_children(master_executor, [child_executor], trade_event)
+    return mirrored[0]
+
+
+async def mirror_trade_to_children(
+    master_executor: PocketOptionTradeExecutor,
+    child_executors: list[PocketOptionTradeExecutor],
+    trade_event: dict[str, Any],
+) -> list[dict[str, Any]]:
     asset = normalize_asset(trade_event.get("asset"))
     if not asset:
         raise ValueError(f"Master trade event is missing asset: {trade_event}")
@@ -661,7 +684,9 @@ async def mirror_trade_to_child(master_executor: PocketOptionTradeExecutor, chil
 
     plan = create_trade_plan(asset, action, amount, duration)
     logger.info("child mirror plan | %s", json.dumps(plan, default=str))
-    return await execute_child_trade_plan(master_executor, child_executor, plan)
+    return await asyncio.gather(
+        *(execute_child_trade_plan(master_executor, child_executor, plan) for child_executor in child_executors)
+    )
 
 
 if __name__ == "__main__":
