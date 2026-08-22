@@ -5,9 +5,9 @@ A one-way Python trade mirror for Pocket Option accounts. The bot watches the ma
 ## How it works
 
 1. Connects to the master account and all configured child accounts.
-2. Polls the master's open deals once per second.
+2. Receives newly opened master deals through the client's websocket event stream.
 3. Ignores deals that were already open when the process started by default.
-4. Detects newly opened master deals and mirrors them to all children concurrently.
+4. Mirrors each newly detected master deal to all children concurrently with no intentional one-second delay.
 5. Uses the master's asset, direction, amount, and duration when those values are available.
 
 This is intentionally one-way: child trades are not copied back to the master, and closing or modifying a master deal is not mirrored.
@@ -80,6 +80,8 @@ python mirror_trade.py
 ```
 
 The process runs continuously until interrupted with `Ctrl+C`. Runtime messages are written to the console and to `mirror_trade.log`. The log file is ignored by Git.
+
+The primary path is event-driven for low latency. A one-second polling request remains as a recovery fallback when the client does not deliver an open-order event, such as when using a legacy client or after a missed websocket notification.
 
 ## Testing
 

@@ -30,6 +30,7 @@ class PocketOptionTradeExecutor:
         self._wait_task: asyncio.Task | None = None
         self._opened_deals_snapshot: list[Any] = []
         self._opened_deals_event: asyncio.Event | None = None
+        self._opened_trade_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
     def _extract_ssid_payload(self, ssid: str) -> tuple[str, dict[str, Any]]:
         if not ssid:
@@ -178,6 +179,20 @@ class PocketOptionTradeExecutor:
         except Exception:
             payload = _serialize_deal(deal)
         logger.info("%s | observed opened deal | %s", self.label, json.dumps(payload, default=str))
+        if "asset" in payload and "action" in payload:
+            await self._opened_trade_events.put(payload)
+
+    async def next_opened_trade(self, timeout: float | None = None) -> dict[str, Any] | None:
+        try:
+            if timeout is None:
+                return await self._opened_trade_events.get()
+            return await asyncio.wait_for(self._opened_trade_events.get(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+
+    def discard_opened_trade_events(self) -> None:
+        while not self._opened_trade_events.empty():
+            self._opened_trade_events.get_nowait()
 
     async def _handle_opened_deals_update(self, deals: list[Any] | None) -> None:
         self._opened_deals_snapshot = list(deals or [])
@@ -597,17 +612,18 @@ async def run_mirror_loop(master_executor: PocketOptionTradeExecutor, child_exec
         existing_deals = await master_executor.get_open_deals()
         seen_trade_ids.update(_extract_trade_id(deal) for deal in existing_deals if _extract_trade_id(deal))
         logger.info("mirror loop baseline set | existing_open_deals=%s", len(seen_trade_ids))
+    master_executor.discard_opened_trade_events()
 
     while True:
         try:
-            trade_events = await detect_master_trade_events(master_executor, seen_trade_ids)
+            event = await master_executor.next_opened_trade(timeout=1.0)
+            trade_events = [event] if event else await detect_master_trade_events(master_executor, seen_trade_ids)
         except Exception as exc:
             logger.exception("mirror loop error: %s", exc)
-            await asyncio.sleep(1)
+            await asyncio.sleep(0.25)
             continue
 
         if not trade_events:
-            await asyncio.sleep(1)
             continue
 
         for trade_event in trade_events:
@@ -622,7 +638,7 @@ async def run_mirror_loop(master_executor: PocketOptionTradeExecutor, child_exec
             except Exception as exc:
                 logger.exception("child trade mirror failed: %s", exc)
 
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.05)
 
 
 async def detect_master_trade_event(master_executor: PocketOptionTradeExecutor, last_seen_trade_id: str | None) -> dict[str, Any] | None:

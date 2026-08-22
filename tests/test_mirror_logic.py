@@ -1,3 +1,4 @@
+import asyncio
 import sys
 from pathlib import Path
 
@@ -55,6 +56,28 @@ def test_get_child_ssids_includes_legacy_and_numbered_children():
     }
 
     assert get_child_ssids(config) == ["first", "second", "tenth"]
+
+
+def test_open_deal_callback_queues_trade_event_without_polling():
+    from mirror_trade import PocketOptionTradeExecutor
+
+    class Deal:
+        id = "deal-1"
+        command = 0
+        asset = "EURUSD"
+        amount = 1.0
+        time = 60
+
+    executor = PocketOptionTradeExecutor("ssid", "master")
+
+    async def receive_event():
+        await executor._handle_success_open_deal(Deal())
+        return await executor.next_opened_trade(timeout=0.01)
+
+    event = asyncio.run(receive_event())
+
+    assert event["trade_id"] == "deal-1"
+    assert event["action"] == "call"
 
 
 def test_extracts_ssid_and_payload_from_wrapper():
