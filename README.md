@@ -36,10 +36,11 @@ On systems where PowerShell script execution is restricted, activate the environ
 
 ## Configuration
 
-Copy the example file to `.env` and fill in the account sessions:
+Create the profile files from the templates and fill in the account sessions:
 
 ```powershell
-Copy-Item .env.example .env
+Copy-Item .env.demo.example .env.demo
+Copy-Item .env.live.example .env.live
 ```
 
 Example:
@@ -67,17 +68,22 @@ MIRROR_EXISTING_OPEN_DEALS=false
 | `POCKET_OPTION_REGION` | No | Client region name. The default is `DEMO` for demo sessions and `EUROPA` otherwise. |
 | `MIRROR_EXISTING_OPEN_DEALS` | No | Set to `true`, `1`, `yes`, or `on` to mirror deals already open at startup. Defaults to false. |
 
-The loader reads `.env` from the repository directory. Values supplied as environment variables override `MASTER_SSID` and `CHILD_SSID`; numbered `CHILD_SSID_N` environment variables are also supported. Keep `.env` private: it is ignored by Git.
+Values supplied as environment variables override `MASTER_SSID` and `CHILD_SSID`; numbered `CHILD_SSID_N` environment variables are also supported. Keep `.env` private: it is ignored by Git.
+
+The selected mode reads only its matching profile: demo mode reads `.env.demo` and live mode reads `.env.live`. Both profile files are ignored by Git. The older `.env` file is retained for compatibility with older revisions but is not used by the mode-based command.
 
 Some Pocket Option clients provide an auth wrapper rather than only the session token. The executor accepts either the plain SSID or the compatible `...["auth",{...}]` payload format.
 
 ## Running
 
-With the virtual environment active:
+With the virtual environment active, choose a mode explicitly:
 
 ```powershell
-python mirror_trade.py
+python mirror_trade.py --mode demo
+python mirror_trade.py --mode live
 ```
+
+Running without `--mode` asks which profile to use. Live mode additionally requires typing `LIVE` as an explicit confirmation before the accounts are connected.
 
 The process runs continuously until interrupted with `Ctrl+C`. Runtime messages are written to the console and to `mirror_trade.log`. The log file is ignored by Git.
 
@@ -107,5 +113,6 @@ The tests cover action normalization, trade event parsing, child ordering, trade
 - `mirror_trade.py` - connection, deal detection, normalization, and mirroring loop
 - `logger.py` - console and file logging setup
 - `tests/test_mirror_logic.py` - unit tests for the mirror logic
-- `.env.example` - configuration template
+- `.env.demo.example` - demo profile template
+- `.env.live.example` - live profile template
 - `requirements.txt` - Python dependencies

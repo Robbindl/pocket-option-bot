@@ -1,4 +1,5 @@
 import asyncio
+import argparse
 import datetime as dt
 import json
 import os
@@ -550,9 +551,9 @@ async def execute_child_trade_plan(master_executor: Any, child_executor: Any, pl
     }
 
 
-def load_config() -> dict[str, str]:
+def load_config(mode: str = "demo") -> dict[str, str]:
     config: dict[str, str] = {}
-    env_path = Path(__file__).resolve().parent / ".env"
+    env_path = Path(__file__).resolve().parent / f".env.{mode}"
     if env_path.exists():
         for line in env_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
@@ -580,26 +581,54 @@ def get_child_ssids(config: dict[str, str] | None = None) -> list[str]:
     return [config[key] for key in child_keys if config[key].strip()]
 
 
-def main() -> None:
-    config = load_config()
+def main(mode: str | None = None) -> None:
+    if mode is None:
+        parser = argparse.ArgumentParser(description="Mirror Pocket Option master trades to child accounts")
+        parser.add_argument("--mode", choices=("demo", "live"), help="account profile to use")
+        mode = parser.parse_args().mode
+
+    if mode is None:
+        mode = input("Choose account mode (demo/live): ").strip().lower()
+    if mode not in {"demo", "live"}:
+        raise SystemExit("Mode must be demo or live")
+
+    if mode == "live":
+        confirmation = input("LIVE mode places real trades. Type LIVE to continue: ").strip()
+        if confirmation != "LIVE":
+            raise SystemExit("Live mode was not confirmed")
+
+    config = load_config(mode)
+    profile_path = Path(__file__).resolve().parent / f".env.{mode}"
+    if not profile_path.exists():
+        raise SystemExit(f"Create {profile_path.name} with the {mode} account credentials before starting")
+
     master_ssid = config.get("MASTER_SSID") or os.getenv("MASTER_SSID")
     child_ssids = get_child_ssids(config)
     if not master_ssid or not child_ssids:
-        raise SystemExit("Set MASTER_SSID and at least one CHILD_SSID in your environment or .env file before running this script")
+        raise SystemExit(f"Set MASTER_SSID and at least one CHILD_SSID in {profile_path.name} or your environment before running this script")
 
-    logger.info("mirror mode enabled | master=%s | children=%s", master_ssid[:8], len(child_ssids))
-    print("One-way mirror mode enabled: the child account will mirror the master account trade automatically.")
+    is_demo = 1 if mode == "demo" else 0
+    logger.info("mirror mode enabled | mode=%s | master=%s | children=%s", mode, master_ssid[:8], len(child_ssids))
+    print(f"One-way {mode} mirror mode enabled: child accounts will mirror master trades automatically.")
 
-    master_executor = PocketOptionTradeExecutor(master_ssid, "master")
-    child_executors = [PocketOptionTradeExecutor(ssid, f"child-{index}") for index, ssid in enumerate(child_ssids, 1)]
+    region = config.get("POCKET_OPTION_REGION")
+    master_executor = PocketOptionTradeExecutor(master_ssid, "master", region=region, is_demo=is_demo)
+    child_executors = [
+        PocketOptionTradeExecutor(ssid, f"child-{index}", region=region, is_demo=is_demo)
+        for index, ssid in enumerate(child_ssids, 1)
+    ]
 
     try:
-        asyncio.run(run_mirror_loop(master_executor, child_executors))
+        asyncio.run(run_mirror_loop(master_executor, child_executors, config=config))
     except KeyboardInterrupt:
         logger.info("mirror mode stopped by user")
 
 
-async def run_mirror_loop(master_executor: PocketOptionTradeExecutor, child_executors: list[PocketOptionTradeExecutor]) -> None:
+async def run_mirror_loop(
+    master_executor: PocketOptionTradeExecutor,
+    child_executors: list[PocketOptionTradeExecutor],
+    config: dict[str, str] | None = None,
+) -> None:
     logger.info("mirror loop started")
     await asyncio.gather(
         master_executor.ensure_connected(),
@@ -607,7 +636,8 @@ async def run_mirror_loop(master_executor: PocketOptionTradeExecutor, child_exec
     )
     seen_trade_ids: set[str] = set()
 
-    mirror_existing = (os.getenv("MIRROR_EXISTING_OPEN_DEALS") or load_config().get("MIRROR_EXISTING_OPEN_DEALS") or "")
+    config = config or load_config()
+    mirror_existing = os.getenv("MIRROR_EXISTING_OPEN_DEALS") or config.get("MIRROR_EXISTING_OPEN_DEALS") or ""
     if mirror_existing.strip().lower() not in {"1", "true", "yes", "on"}:
         existing_deals = await master_executor.get_open_deals()
         seen_trade_ids.update(_extract_trade_id(deal) for deal in existing_deals if _extract_trade_id(deal))

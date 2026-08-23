@@ -1,5 +1,7 @@
 # Environment and secrets
 .env
+.env.demo
+.env.live
 !.env.example
 
 # Python environments and caches
