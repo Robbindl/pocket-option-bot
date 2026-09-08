@@ -32,6 +32,7 @@ class PocketOptionTradeExecutor:
         self._opened_deals_snapshot: list[Any] = []
         self._opened_deals_event: asyncio.Event | None = None
         self._opened_trade_events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._queued_trade_ids: set[str] = set()
         self._balance: Any | None = None
         self._balance_event = asyncio.Event()
 
@@ -216,19 +217,31 @@ class PocketOptionTradeExecutor:
             payload = _serialize_deal(deal)
         logger.info("%s | observed opened deal | %s", self.label, json.dumps(payload, default=str))
         if "asset" in payload and "action" in payload:
+            trade_id = payload.get("trade_id")
+            if trade_id and trade_id in self._queued_trade_ids:
+                logger.debug("%s | ignoring duplicate opened deal event | trade_id=%s", self.label, trade_id)
+                return
+            if trade_id:
+                self._queued_trade_ids.add(trade_id)
             await self._opened_trade_events.put(payload)
 
     async def next_opened_trade(self, timeout: float | None = None) -> dict[str, Any] | None:
         try:
             if timeout is None:
-                return await self._opened_trade_events.get()
-            return await asyncio.wait_for(self._opened_trade_events.get(), timeout=timeout)
+                event = await self._opened_trade_events.get()
+            else:
+                event = await asyncio.wait_for(self._opened_trade_events.get(), timeout=timeout)
+            trade_id = event.get("trade_id")
+            if trade_id:
+                self._queued_trade_ids.discard(trade_id)
+            return event
         except asyncio.TimeoutError:
             return None
 
     def discard_opened_trade_events(self) -> None:
         while not self._opened_trade_events.empty():
             self._opened_trade_events.get_nowait()
+        self._queued_trade_ids.clear()
 
     async def _handle_opened_deals_update(self, deals: list[Any] | None) -> None:
         self._opened_deals_snapshot = list(deals or [])
@@ -693,22 +706,37 @@ async def run_mirror_loop(
         logger.info("mirror loop baseline set | existing_open_deals=%s", len(seen_trade_ids))
     master_executor.discard_opened_trade_events()
 
+    poll_idle_count = 0
     while True:
         try:
-            event = await master_executor.next_opened_trade(timeout=1.0)
-            trade_events = [event] if event else await detect_master_trade_events(master_executor, seen_trade_ids)
+            event = await master_executor.next_opened_trade(timeout=0.1)
+            if event:
+                trade_events = [event]
+                poll_idle_count = 0
+            else:
+                poll_idle_count += 1
+                if poll_idle_count >= 10:
+                    trade_events = await detect_master_trade_events(master_executor, seen_trade_ids)
+                    poll_idle_count = 0
+                else:
+                    trade_events = []
         except Exception as exc:
             logger.exception("mirror loop error: %s", exc)
             await asyncio.sleep(0.25)
             continue
 
         if not trade_events:
+            await asyncio.sleep(0.01)
             continue
 
         for trade_event in trade_events:
             trade_id = trade_event.get("trade_id")
-            if trade_id:
-                seen_trade_ids.add(str(trade_id))
+            normalized_trade_id = str(trade_id) if trade_id else ""
+            if normalized_trade_id and normalized_trade_id in seen_trade_ids:
+                logger.debug("ignoring duplicate master trade event | trade_id=%s", normalized_trade_id)
+                continue
+            if normalized_trade_id:
+                seen_trade_ids.add(normalized_trade_id)
 
             logger.info("master trade detected | %s", json.dumps(trade_event, default=str))
             try:
@@ -717,7 +745,7 @@ async def run_mirror_loop(
             except Exception as exc:
                 logger.exception("child trade mirror failed: %s", exc)
 
-        await asyncio.sleep(0.05)
+        await asyncio.sleep(0.01)
 
 
 async def detect_master_trade_event(master_executor: PocketOptionTradeExecutor, last_seen_trade_id: str | None) -> dict[str, Any] | None:

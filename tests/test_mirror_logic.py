@@ -89,6 +89,31 @@ def test_open_deal_callback_queues_trade_event_without_polling():
     assert event["action"] == "call"
 
 
+def test_open_deal_callback_deduplicates_repeated_trade_events():
+    from mirror_trade import PocketOptionTradeExecutor
+
+    class Deal:
+        id = "deal-1"
+        command = 0
+        asset = "EURUSD"
+        amount = 1.0
+        time = 60
+
+    executor = PocketOptionTradeExecutor("ssid", "master")
+
+    async def receive_events():
+        await executor._handle_success_open_deal(Deal())
+        await executor._handle_success_open_deal(Deal())
+        first = await executor.next_opened_trade(timeout=0.01)
+        second = await executor.next_opened_trade(timeout=0.01)
+        return first, second
+
+    first, second = asyncio.run(receive_events())
+
+    assert first["trade_id"] == "deal-1"
+    assert second is None
+
+
 def test_balance_callback_records_and_logs_balance():
     from mirror_trade import PocketOptionTradeExecutor
 
