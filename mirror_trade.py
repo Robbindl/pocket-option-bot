@@ -5,13 +5,14 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
+from telegram_control import MirrorControlState, TelegramMirrorController, load_telegram_config
 from logger import setup_logger
 
 logger = setup_logger("mirror_trade", log_file=str(Path(__file__).resolve().parent / "mirror_trade.log"))
-
 
 class PocketOptionTradeExecutor:
     """Minimal executor that opens a trade using a compatible Pocket Option client."""
@@ -35,6 +36,18 @@ class PocketOptionTradeExecutor:
         self._queued_trade_ids: set[str] = set()
         self._balance: Any | None = None
         self._balance_event = asyncio.Event()
+        self._balance_updated_at: dt.datetime | None = None
+
+    @property
+    def connection_status(self) -> str:
+        if self._client is None:
+            return "disconnected"
+        if self._client_type == "async":
+            authorized_event = getattr(self._client, "authorized_event", None)
+            if authorized_event is not None and authorized_event.is_set():
+                return "connected"
+            return "connecting"
+        return "connected"
 
     def _extract_ssid_payload(self, ssid: str) -> tuple[str, dict[str, Any]]:
         if not ssid:
@@ -185,8 +198,15 @@ class PocketOptionTradeExecutor:
             balance = getattr(update, "balance", None)
 
         self._balance = balance
+        self._balance_updated_at = dt.datetime.now()
         self._balance_event.set()
         logger.info("%s | balance=%s", self.label, balance)
+
+    async def refresh_balance(self) -> Any | None:
+        if self._client is None or self.connection_status != "connected":
+            return self._balance
+        await self._request_balance(self._client)
+        return self._balance
 
     async def _request_balance(self, client: Any) -> None:
         emit = getattr(client, "emit", None)
@@ -212,10 +232,25 @@ class PocketOptionTradeExecutor:
     async def _handle_success_open_deal(self, deal: Any) -> None:
         self._remember_open_deal(deal)
         try:
-            payload = _deal_to_trade_event(deal)
+            payload = _deal_to_trade_event(deal, include_raw=False)
         except Exception:
-            payload = _serialize_deal(deal)
-        logger.info("%s | observed opened deal | %s", self.label, json.dumps(payload, default=str))
+            payload = {
+                "trade_id": _extract_trade_id(deal),
+                "asset": normalize_asset(_get_deal_value(deal, "asset", "symbol")),
+                "action": normalize_action(_get_deal_value(deal, "command", "action", "direction")),
+                "amount": _to_float(_get_deal_value(deal, "amount", "amount_usd", "amountUSD")),
+                "duration": _extract_duration(deal),
+            }
+        payload["_event_received_at"] = time.perf_counter()
+        logger.info(
+            "%s | observed opened deal | trade_id=%s | asset=%s | action=%s | amount=%s | duration=%s",
+            self.label,
+            payload.get("trade_id"),
+            payload.get("asset"),
+            payload.get("action"),
+            payload.get("amount"),
+            payload.get("duration"),
+        )
         if "asset" in payload and "action" in payload:
             trade_id = payload.get("trade_id")
             if trade_id and trade_id in self._queued_trade_ids:
@@ -272,6 +307,7 @@ class PocketOptionTradeExecutor:
         norm_action = normalize_action(action)
         order_amount = int(float(amount))
         order_duration = int(duration)
+        submit_started_at = time.perf_counter()
         logger.info(
             "%s | opening trade | asset=%s | action=%s | amount=%.2f | duration=%s",
             self.label,
@@ -288,7 +324,7 @@ class PocketOptionTradeExecutor:
                 raise RuntimeError(f"The Pocket Option client does not expose a supported trade method for {self.label}")
 
             trade_id, deal = trade_method(asset=asset, amount=order_amount, time=order_duration)
-            return {
+            result = {
                 "label": self.label,
                 "ssid": self.ssid,
                 "asset": asset,
@@ -298,6 +334,14 @@ class PocketOptionTradeExecutor:
                 "trade_id": trade_id,
                 "deal": deal,
             }
+            logger.info(
+                "%s | trade accepted | trade_id=%s | latency_ms=%.1f | timing=%s",
+                self.label,
+                trade_id,
+                (time.perf_counter() - submit_started_at) * 1000,
+                json.dumps(_deal_timing(deal), default=str),
+            )
+            return result
 
         from pocket_option.models import Asset, DealAction
 
@@ -325,7 +369,13 @@ class PocketOptionTradeExecutor:
             "trade_id": str(getattr(deal, "id", "")),
             "deal": deal,
         }
-        logger.info("%s | trade accepted | %s", self.label, json.dumps(result, default=str))
+        logger.info(
+            "%s | trade accepted | trade_id=%s | latency_ms=%.1f | timing=%s",
+            self.label,
+            result["trade_id"],
+            (time.perf_counter() - submit_started_at) * 1000,
+            json.dumps(_deal_timing(deal), default=str),
+        )
         return result
 
     async def refresh_open_deals(self, timeout: float = 0.5) -> list[Any]:
@@ -490,21 +540,35 @@ def _deal_open_sort_key(deal: Any) -> tuple[float, str]:
     return (open_timestamp, _extract_trade_id(deal))
 
 
-def _deal_to_trade_event(deal: Any) -> dict[str, Any]:
-    raw = _serialize_deal(deal)
+def _deal_to_trade_event(deal: Any, *, include_raw: bool = False) -> dict[str, Any]:
     asset = normalize_asset(_get_deal_value(deal, "asset", "symbol"))
     action = normalize_action(_get_deal_value(deal, "command", "action", "direction"))
     amount = _to_float(_get_deal_value(deal, "amount", "amount_usd", "amountUSD"))
     duration = _extract_duration(deal)
     trade_id = _extract_trade_id(deal)
+    open_timestamp = _to_timestamp(_get_deal_value(deal, "open_timestamp", "openTime", "open_time"))
+    close_timestamp = _to_timestamp(_get_deal_value(deal, "close_timestamp", "closeTime", "close_time"))
 
-    return {
+    event: dict[str, Any] = {
         "trade_id": trade_id,
         "asset": asset,
         "action": action,
         "amount": amount,
         "duration": duration,
-        "raw": raw,
+        "open_timestamp": open_timestamp,
+        "close_timestamp": close_timestamp,
+    }
+    if include_raw:
+        event["raw"] = _serialize_deal(deal)
+    return event
+
+
+def _deal_timing(deal: Any) -> dict[str, float | None]:
+    return {
+        "open_timestamp": _to_timestamp(_get_deal_value(deal, "open_timestamp", "openTime", "open_time")),
+        "close_timestamp": _to_timestamp(_get_deal_value(deal, "close_timestamp", "closeTime", "close_time")),
+        "open_ms": _to_float(_get_deal_value(deal, "open_ms", "openMs")),
+        "close_ms": _to_float(_get_deal_value(deal, "close_ms", "closeMs")),
     }
 
 
@@ -587,6 +651,12 @@ def execute_trade_plan(master_executor: Any, child_executor: Any, plan: dict[str
 
 async def execute_child_trade_plan(master_executor: Any, child_executor: Any, plan: dict[str, dict[str, Any]]) -> dict[str, Any]:
     logger.info("mirror mode | placing child trade for master event")
+    event_received_at = plan["child"].get("_event_received_at")
+    if event_received_at is not None:
+        logger.info(
+            "child order submit | event_to_submit_ms=%.1f",
+            (time.perf_counter() - event_received_at) * 1000,
+        )
     child_result = await child_executor.place_trade(
         plan["child"]["asset"],
         plan["child"]["action"],
@@ -625,7 +695,7 @@ def load_config(mode: str = "demo") -> dict[str, str]:
             key, value = line.split("=", 1)
             config[key.strip()] = value.strip().strip('"').strip("'")
 
-    for key in ["MASTER_SSID", "CHILD_SSID", "LIVE_CONFIRMATION"]:
+    for key in ["MASTER_SSID", "CHILD_SSID", "LIVE_CONFIRMATION", "TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_CHAT_ID"]:
         env_value = os.getenv(key)
         if env_value is not None:
             config[key] = env_value
@@ -674,6 +744,11 @@ def main(mode: str | None = None) -> None:
     print(f"One-way {mode} mirror mode enabled: child accounts will mirror master trades automatically.")
 
     region = config.get("POCKET_OPTION_REGION")
+    control_state = MirrorControlState()
+    telegram_config = load_telegram_config(config)
+    if telegram_config.get("TELEGRAM_BOT_TOKEN") and telegram_config.get("TELEGRAM_ALLOWED_CHAT_ID"):
+        logger.info("telegram control enabled | chat_id=%s", telegram_config["TELEGRAM_ALLOWED_CHAT_ID"])
+
     master_executor = PocketOptionTradeExecutor(master_ssid, "master", region=region, is_demo=is_demo)
     child_executors = [
         PocketOptionTradeExecutor(ssid, f"child-{index}", region=region, is_demo=is_demo)
@@ -681,7 +756,7 @@ def main(mode: str | None = None) -> None:
     ]
 
     try:
-        asyncio.run(run_mirror_loop(master_executor, child_executors, config=config))
+        asyncio.run(run_mirror_loop(master_executor, child_executors, config=config, control_state=control_state))
     except KeyboardInterrupt:
         logger.info("mirror mode stopped by user")
 
@@ -690,46 +765,91 @@ async def run_mirror_loop(
     master_executor: PocketOptionTradeExecutor,
     child_executors: list[PocketOptionTradeExecutor],
     config: dict[str, str] | None = None,
+    control_state: MirrorControlState | None = None,
 ) -> None:
     logger.info("mirror loop started")
+    control_state = control_state or MirrorControlState()
+    control_state.configure_accounts(master_executor, child_executors)
+    telegram_config = load_telegram_config(config)
+    telegram_controller = None
+    if telegram_config.get("TELEGRAM_BOT_TOKEN") and telegram_config.get("TELEGRAM_ALLOWED_CHAT_ID"):
+        telegram_controller = TelegramMirrorController(
+            telegram_config["TELEGRAM_BOT_TOKEN"],
+            telegram_config["TELEGRAM_ALLOWED_CHAT_ID"],
+            control_state=control_state,
+            allow_insecure_ssl=telegram_config.get("TELEGRAM_ALLOW_INSECURE_SSL", "").strip().lower() in {"1", "true", "yes", "on"},
+        )
+        asyncio.create_task(telegram_controller.start())
+
     await asyncio.gather(
         master_executor.ensure_connected(),
         *(child_executor.ensure_connected() for child_executor in child_executors),
     )
-    seen_trade_ids: set[str] = set()
 
     config = config or load_config()
     mirror_existing = os.getenv("MIRROR_EXISTING_OPEN_DEALS") or config.get("MIRROR_EXISTING_OPEN_DEALS") or ""
-    if mirror_existing.strip().lower() not in {"1", "true", "yes", "on"}:
-        existing_deals = await master_executor.get_open_deals()
-        seen_trade_ids.update(_extract_trade_id(deal) for deal in existing_deals if _extract_trade_id(deal))
-        logger.info("mirror loop baseline set | existing_open_deals=%s", len(seen_trade_ids))
-    master_executor.discard_opened_trade_events()
 
-    poll_idle_count = 0
+    async def initialize_source(executor: PocketOptionTradeExecutor) -> set[str]:
+        seen_ids: set[str] = set()
+        if mirror_existing.strip().lower() not in {"1", "true", "yes", "on"}:
+            existing_deals = await executor.get_open_deals()
+            seen_ids.update(
+                trade_id
+                for deal in existing_deals
+                if (trade_id := _extract_trade_id(deal))
+            )
+        executor.discard_opened_trade_events()
+        logger.info("mirror source baseline set | source=%s | existing_open_deals=%s", executor.label, len(seen_ids))
+        return seen_ids
+
+    active_master = control_state.master_executor or master_executor
+    seen_trade_ids = await initialize_source(active_master)
+    recovery_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    recovery_task = asyncio.create_task(
+        recover_master_trade_events(active_master, seen_trade_ids, recovery_queue)
+    )
+    mirror_slots = asyncio.Semaphore(8)
+    mirror_tasks: set[asyncio.Task] = set()
+
     while True:
         try:
-            event = await master_executor.next_opened_trade(timeout=0.1)
-            if event:
-                trade_events = [event]
-                poll_idle_count = 0
-            else:
-                poll_idle_count += 1
-                if poll_idle_count >= 10:
-                    trade_events = await detect_master_trade_events(master_executor, seen_trade_ids)
-                    poll_idle_count = 0
-                else:
-                    trade_events = []
+            event_task = asyncio.create_task(active_master.next_opened_trade())
+            recovery_event_task = asyncio.create_task(recovery_queue.get())
+            master_changed_task = asyncio.create_task(control_state.master_changed.wait())
+            done, pending = await asyncio.wait(
+                {event_task, recovery_event_task, master_changed_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for pending_task in pending:
+                pending_task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            if master_changed_task in done:
+                control_state.master_changed.clear()
+                selected_master = control_state.master_executor or master_executor
+                if selected_master is not active_master:
+                    recovery_task.cancel()
+                    await asyncio.gather(recovery_task, return_exceptions=True)
+                    active_master = selected_master
+                    seen_trade_ids = await initialize_source(active_master)
+                    recovery_queue = asyncio.Queue()
+                    recovery_task = asyncio.create_task(
+                        recover_master_trade_events(active_master, seen_trade_ids, recovery_queue)
+                    )
+                continue
+            trade_events = [completed_task.result() for completed_task in done]
         except Exception as exc:
             logger.exception("mirror loop error: %s", exc)
             await asyncio.sleep(0.25)
             continue
 
-        if not trade_events:
-            await asyncio.sleep(0.01)
-            continue
-
         for trade_event in trade_events:
+            if not trade_event:
+                continue
+            if not control_state.should_process_trade():
+                logger.info("mirror loop paused | ignoring master event | trade_id=%s", trade_event.get("trade_id"))
+                continue
+            trade_event.setdefault("_event_received_at", time.perf_counter())
             trade_id = trade_event.get("trade_id")
             normalized_trade_id = str(trade_id) if trade_id else ""
             if normalized_trade_id and normalized_trade_id in seen_trade_ids:
@@ -738,14 +858,70 @@ async def run_mirror_loop(
             if normalized_trade_id:
                 seen_trade_ids.add(normalized_trade_id)
 
-            logger.info("master trade detected | %s", json.dumps(trade_event, default=str))
-            try:
-                mirrored = await mirror_trade_to_children(master_executor, child_executors, trade_event)
-                logger.info("child trades mirrored | count=%s", len(mirrored))
-            except Exception as exc:
-                logger.exception("child trade mirror failed: %s", exc)
+            logger.info(
+                "master trade detected | trade_id=%s | asset=%s | action=%s | amount=%s | duration=%s",
+                trade_event.get("trade_id"),
+                trade_event.get("asset"),
+                trade_event.get("action"),
+                trade_event.get("amount"),
+                trade_event.get("duration"),
+            )
+            control_state.record_trade(trade_event, "detected")
+            control_state.begin_trade()
+            mirror_task = asyncio.create_task(
+                dispatch_mirror_trade(
+                    active_master,
+                    child_executors,
+                    trade_event,
+                    mirror_slots,
+                    control_state,
+                )
+            )
+            mirror_tasks.add(mirror_task)
+            mirror_task.add_done_callback(mirror_tasks.discard)
 
-        await asyncio.sleep(0.01)
+
+async def recover_master_trade_events(
+    master_executor: PocketOptionTradeExecutor,
+    seen_trade_ids: set[str],
+    recovery_queue: asyncio.Queue[dict[str, Any]],
+) -> None:
+    while True:
+        try:
+            trade_events = await detect_master_trade_events(master_executor, seen_trade_ids)
+            for trade_event in trade_events:
+                await recovery_queue.put(trade_event)
+        except Exception as exc:
+            logger.warning("master deal recovery failed: %s", exc)
+        await asyncio.sleep(1.0)
+
+
+async def dispatch_mirror_trade(
+    master_executor: PocketOptionTradeExecutor,
+    child_executors: list[PocketOptionTradeExecutor],
+    trade_event: dict[str, Any],
+    mirror_slots: asyncio.Semaphore,
+    control_state: MirrorControlState | None = None,
+) -> None:
+    try:
+        async with mirror_slots:
+            selected_children = control_state.child_executors() if control_state else child_executors
+            if not selected_children:
+                logger.info("no enabled child accounts; skipping mirror | trade_id=%s", trade_event.get("trade_id"))
+                if control_state:
+                    control_state.record_trade(trade_event, "no children enabled")
+                return
+            mirrored = await mirror_trade_to_children(master_executor, selected_children, trade_event)
+            logger.info("child trades mirrored | count=%s", len(mirrored))
+            if control_state:
+                control_state.record_trade(trade_event, f"mirrored {len(mirrored)}")
+    except Exception as exc:
+        logger.exception("child trade mirror failed: %s", exc)
+        if control_state:
+            control_state.record_trade(trade_event, "failed")
+    finally:
+        if control_state:
+            control_state.end_trade()
 
 
 async def detect_master_trade_event(master_executor: PocketOptionTradeExecutor, last_seen_trade_id: str | None) -> dict[str, Any] | None:
@@ -780,7 +956,6 @@ async def detect_master_trade_events(
             logger.warning("unable to parse master deal event: %s | raw=%s", exc, json.dumps(_serialize_deal(deal), default=str))
             continue
 
-        logger.info("master trade event payload | %s", json.dumps(payload, default=str))
         trade_events.append(payload)
 
     return trade_events
@@ -806,7 +981,15 @@ async def mirror_trade_to_children(
     duration = int(duration_value) if duration_value and duration_value > 0 else _default_duration()
 
     plan = create_trade_plan(asset, action, amount, duration)
-    logger.info("child mirror plan | %s", json.dumps(plan, default=str))
+    plan["child"]["_event_received_at"] = trade_event.get("_event_received_at")
+    logger.info(
+        "child mirror plan | asset=%s | action=%s | amount=%s | duration=%s | children=%s",
+        asset,
+        action,
+        amount,
+        duration,
+        len(child_executors),
+    )
     return await asyncio.gather(
         *(execute_child_trade_plan(master_executor, child_executor, plan) for child_executor in child_executors)
     )

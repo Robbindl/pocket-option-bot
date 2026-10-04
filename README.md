@@ -55,6 +55,8 @@ DURATION=60
 POCKET_OPTION_REGION=DEMO
 MIRROR_EXISTING_OPEN_DEALS=false
 LIVE_CONFIRMATION=LIVE
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_ALLOWED_CHAT_ID=
 ```
 
 ### Configuration values
@@ -69,6 +71,9 @@ LIVE_CONFIRMATION=LIVE
 | `POCKET_OPTION_REGION` | No | Client region name. The default is `DEMO` for demo sessions and `EUROPA` otherwise. |
 | `MIRROR_EXISTING_OPEN_DEALS` | No | Set to `true`, `1`, `yes`, or `on` to mirror deals already open at startup. Defaults to false. |
 | `LIVE_CONFIRMATION` | Live only | Set to `LIVE` to allow unattended live-mode startup. |
+| `TELEGRAM_BOT_TOKEN` | No | Optional Telegram bot token for mirror and account controls. |
+| `TELEGRAM_ALLOWED_CHAT_ID` | No | Only this Telegram chat can send control commands. Keep this restricted to a trusted user. |
+| `TELEGRAM_ALLOW_INSECURE_SSL` | No | Set to `true` or `1` only on a personal machine with a broken certificate chain; disables TLS verification for Telegram polling only. |
 
 Values supplied as environment variables override `MASTER_SSID` and `CHILD_SSID`; numbered `CHILD_SSID_N` environment variables are also supported. Keep `.env` private: it is ignored by Git.
 
@@ -88,6 +93,8 @@ python mirror_trade.py --mode live
 Running without `--mode` asks which profile to use. Live mode additionally requires typing `LIVE` as an explicit confirmation before the accounts are connected.
 
 The process runs continuously until interrupted with `Ctrl+C`. Runtime messages are written to the console and to `mirror_trade.log`. The log file is ignored by Git.
+
+If `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_CHAT_ID` are configured, the bot listens for commands from that single chat. It provides account connection and mirror status, refreshable balances, recent trade outcomes, child enable/disable controls, and master selection. Commands are `/status`, `/pause`, `/resume`, `/master`, `/children`, `/recent`, `/balance`, and `/help` (`/start` opens Help). Master selection requires mirroring to be paused and in-flight child copies to finish; the former master is then enabled as a child. The control layer never sends SSIDs or sensitive session data in Telegram messages. These controls are runtime-only and reset to the profile configuration after restart.
 
 The primary path is event-driven for low latency. A one-second polling request remains as a recovery fallback when the client does not deliver an open-order event, such as when using a legacy client or after a missed websocket notification.
 
