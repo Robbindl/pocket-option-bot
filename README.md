@@ -98,6 +98,19 @@ If `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_CHAT_ID` are configured, the bot l
 
 The primary path is event-driven for low latency. A one-second polling request remains as a recovery fallback when the client does not deliver an open-order event, such as when using a legacy client or after a missed websocket notification.
 
+## Deploying to Render
+
+This process runs continuously and does not serve HTTP requests, so deploy it as a **Background Worker** using the repository's `render.yaml` Blueprint:
+
+1. Push the repository to GitHub.
+2. In the [Render Dashboard](https://dashboard.render.com/), choose **New > Blueprint** and connect the repository.
+3. Review the Blueprint and create the worker. Background Workers require a paid Render plan; review the current pricing before confirming.
+4. In the worker's **Environment** settings, set `MASTER_SSID` and `CHILD_SSID` to demo-account sessions. Add `CHILD_SSID_2`, `CHILD_SSID_3`, and so on for additional child accounts.
+5. Optionally set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_ALLOWED_CHAT_ID` to enable Telegram controls, then deploy.
+6. Check the worker's logs and confirm that the demo accounts connect successfully before considering any live setup.
+
+The Blueprint starts in **demo** mode with a fallback amount of `1` and duration of `60` seconds. Keep the session SSIDs and Telegram token in Render's environment settings; never put them in `render.yaml` or commit them to Git. Live mode is not enabled by this Blueprint. To use live mode later, deliberately change the start command to `python mirror_trade.py --mode live`, set `LIVE_CONFIRMATION=LIVE`, and configure live-account sessions only after validating the deployment with demo accounts.
+
 ## Testing
 
 Run the focused test suite with:

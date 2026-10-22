@@ -1,0 +1,23 @@
+services:
+  - type: worker
+    name: pocket-option-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python mirror_trade.py --mode demo
+    envVars:
+      - key: MASTER_SSID
+        sync: false
+      - key: CHILD_SSID
+        sync: false
+      - key: AMOUNT
+        value: "1"
+      - key: DURATION
+        value: "60"
+      - key: POCKET_OPTION_REGION
+        value: DEMO
+      - key: MIRROR_EXISTING_OPEN_DEALS
+        value: "false"
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_ALLOWED_CHAT_ID
+        sync: false
